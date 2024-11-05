@@ -1,0 +1,86 @@
+#!/bin/bash
+
+# Aktualizacja systemu
+sudo apt update
+sudo apt upgrade -y
+
+# 1. Instalacja podstawowych narzędzi
+sudo apt install -y \
+    python3-dev \
+    python3-pip \
+    unixodbc-dev \
+    krb5-user \
+    libkrb5-dev \
+    libssl-dev \
+    libsasl2-dev \
+    libsasl2-modules-gssapi-mit \
+    curl \
+    gnupg \
+    odbcinst
+
+# 2. Dodanie repozytorium Microsoft
+curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+
+# Dodanie repozytorium w zależności od wersji Ubuntu
+# Dla Ubuntu 22.04
+curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+
+# Aktualizacja po dodaniu repozytorium
+sudo apt update
+
+# 3. Instalacja sterownika ODBC
+sudo ACCEPT_EULA=Y apt install -y msodbcsql18
+# Dla starszych aplikacji może być potrzebny msodbcsql17
+sudo ACCEPT_EULA=Y apt install -y msodbcsql17
+
+# 4. Instalacja narzędzi ODBC
+sudo apt install -y unixodbc-dev unixodbc
+
+# 5. Instalacja dodatkowych narzędzi Microsoft
+sudo ACCEPT_EULA=Y apt install -y mssql-tools18
+echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
+source ~/.bashrc
+
+# 6. Sprawdzenie instalacji sterowników ODBC
+odbcinst -j
+
+# 7. Instalacja pakietów Pythona
+pip install --upgrade pip
+pip install \
+    pyodbc \
+    sqlalchemy \
+    gssapi \
+    python-gssapi
+
+# 8. Utworzenie podstawowej konfiguracji Kerberos
+sudo tee /etc/krb5.conf.d/mssql.conf << EOF
+[libdefaults]
+default_realm = TWOJA.DOMENA.COM
+dns_lookup_realm = true
+dns_lookup_kdc = true
+ticket_lifetime = 24h
+forwardable = yes
+
+[realms]
+TWOJA.DOMENA.COM = {
+    kdc = twoj-dc.domena.com
+    admin_server = twoj-dc.domena.com
+}
+
+[domain_realm]
+.domena.com = TWOJA.DOMENA.COM
+domena.com = TWOJA.DOMENA.COM
+EOF
+
+# 9. Ustawienie odpowiednich uprawnień
+sudo chmod 644 /etc/krb5.conf.d/mssql.conf
+
+# 10. Sprawdzenie instalacji
+echo "Sprawdzanie wersji sterownika ODBC:"
+odbcinst -q -d -n "ODBC Driver 18 for SQL Server"
+
+echo "Sprawdzanie konfiguracji Kerberos:"
+klist -k
+
+echo "Sprawdzanie dostępnych sterowników ODBC:"
+odbcinst -j

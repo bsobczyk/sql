@@ -1,151 +1,184 @@
-import pyodbc
-from urllib.parse import quote_plus
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.engine import URL
+import gssapi
+import logging
+import os
+import subprocess
+from pathlib import Path
 
-class ADSQLConnection:
-    def __init__(self, server, database, username, password, ad_domain=None):
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class SQLServerWindowsAuth:
+    def __init__(self, server, database, domain, username, password):
         """
-        Inicjalizuje połączenie SQL z uwierzytelnianiem AD
+        Inicjalizacja połączenia do SQL Server z uwierzytelnianiem Windows
         
         Args:
             server (str): Nazwa serwera SQL
             database (str): Nazwa bazy danych
-            username (str): Nazwa użytkownika AD
+            domain (str): Nazwa domeny (np. FIRMA.COM)
+            username (str): Nazwa użytkownika domenowego
             password (str): Hasło użytkownika
-            ad_domain (str): Domena AD (opcjonalne)
         """
         self.server = server
         self.database = database
+        self.domain = domain.upper()
         self.username = username
         self.password = password
-        self.ad_domain = ad_domain
-        self.conn = None
-    
-    def connect_with_ad_user(self):
+        self.engine = None
+        self.Session = None
+        
+    def setup_krb5_config(self):
         """
-        Tworzy połączenie używając poświadczeń AD
+        Tworzy tymczasowy plik konfiguracyjny Kerberos
         """
-        try:
-            # Jeśli podano domenę, dodaj ją do nazwy użytkownika
-            auth_username = (
-                f"{self.ad_domain}\\{self.username}" 
-                if self.ad_domain 
-                else self.username
-            )
-            
-            # Konfiguracja stringa połączenia
-            conn_str = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                f"SERVER={self.server};"
-                f"DATABASE={self.database};"
-                f"UID={auth_username};"
-                f"PWD={self.password};"
-                "Encrypt=yes;"
-                "TrustServerCertificate=yes;"
-            )
-            
-            # Utworzenie połączenia
-            self.conn = pyodbc.connect(conn_str)
-            print("Połączono pomyślnie z bazą danych!")
-            return self.conn
-            
-        except pyodbc.Error as e:
-            print(f"Błąd podczas łączenia z bazą: {str(e)}")
-            raise
+        krb5_conf = f"""[libdefaults]
+default_realm = {self.domain}
+dns_lookup_realm = false
+dns_lookup_kdc = true
+ticket_lifetime = 24h
+forwardable = true
+proxiable = true
 
-    def test_connection(self):
+[realms]
+{self.domain} = {{
+    kdc = {self.domain.lower()}
+    admin_server = {self.domain.lower()}
+}}
+
+[domain_realm]
+.{self.domain.lower()} = {self.domain}
+{self.domain.lower()} = {self.domain}
+"""
+        # Zapisz do pliku w katalogu użytkownika
+        krb5_path = Path.home() / '.krb5.conf'
+        krb5_path.write_text(krb5_conf)
+        os.environ['KRB5_CONFIG'] = str(krb5_path)
+        return krb5_path
+
+    def get_ticket(self):
         """
-        Testuje połączenie wykonując proste zapytanie
+        Uzyskuje bilet Kerberos używając loginu i hasła
         """
-        if not self.conn:
-            raise Exception("Brak aktywnego połączenia!")
-            
         try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT SYSTEM_USER, CURRENT_USER")
-            row = cursor.fetchone()
-            print(f"Zalogowany użytkownik systemowy: {row[0]}")
-            print(f"Zalogowany użytkownik bazy: {row[1]}")
+            # Usuń stare bilety
+            subprocess.run(['kdestroy'], stderr=subprocess.DEVNULL)
             
-            # Sprawdź uprawnienia użytkownika
-            cursor.execute("""
-                SELECT 
-                    dp.name as principal_name,
-                    dp.type_desc as principal_type,
-                    o.name as object_name,
-                    p.permission_name
-                FROM sys.database_permissions p
-                JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id
-                LEFT JOIN sys.objects o ON p.major_id = o.object_id
-                WHERE dp.name = SYSTEM_USER
-            """)
+            # Przygotuj principal
+            principal = f"{self.username}@{self.domain}"
             
-            print("\nUprawnienia użytkownika:")
-            for row in cursor.fetchall():
-                print(f"- {row.permission_name} na {row.object_name or 'DATABASE'}")
-                
-        except pyodbc.Error as e:
-            print(f"Błąd podczas wykonywania zapytania: {str(e)}")
+            # Utwórz credential cache
+            ccache = "FILE:/tmp/krb5cc_{}".format(os.getuid())
+            os.environ['KRB5CCNAME'] = ccache
+            
+            # Uzyskaj bilet używając loginu i hasła
+            name = gssapi.Name(principal, name_type=gssapi.NameType.user)
+            store = {'ccache': ccache, 'client_name': name}
+            
+            flags = (
+                gssapi.RequirementFlag.delegate_to_peer |
+                gssapi.RequirementFlag.mutual_authentication |
+                gssapi.RequirementFlag.out_of_sequence_detection
+            )
+            
+            gssapi.Credentials(usage='initiate', name=name, password=self.password,
+                             store=store, flags=flags)
+            
+            logger.info(f"Uzyskano bilet Kerberos dla {principal}")
+            return True
+            
+        except gssapi.exceptions.GSSError as e:
+            logger.error(f"Błąd podczas uzyskiwania biletu Kerberos: {str(e)}")
+            raise
+    
+    def create_connection_url(self):
+        """
+        Tworzy URL połączenia dla SQLAlchemy
+        """
+        connection_url = URL.create(
+            "mssql+pyodbc",
+            query={
+                "driver": "ODBC Driver 18 for SQL Server",
+                "TrustServerCertificate": "yes",
+                "Authentication": "ActiveDirectoryIntegrated",
+                "Encrypt": "yes"
+            },
+            host=self.server,
+            database=self.database,
+        )
+        return connection_url
+
+    def connect(self):
+        """
+        Nawiązuje połączenie z bazą danych
+        """
+        try:
+            # Konfiguracja Kerberos
+            krb5_path = self.setup_krb5_config()
+            self.get_ticket()
+            
+            # Utworzenie silnika SQLAlchemy
+            self.engine = create_engine(
+                self.create_connection_url(),
+                echo=False,
+                pool_pre_ping=True
+            )
+            
+            # Utworzenie fabryki sesji
+            self.Session = sessionmaker(bind=self.engine)
+            
+            # Test połączenia
+            with self.engine.connect() as conn:
+                result = conn.execute(text("SELECT SYSTEM_USER"))
+                logger.info(f"Połączono jako: {result.scalar()}")
+            
+            return self.engine
+        
+        except Exception as e:
+            logger.error(f"Błąd podczas łączenia z bazą: {str(e)}")
             raise
         finally:
-            if cursor:
-                cursor.close()
+            # Usuń tymczasowy plik konfiguracyjny
+            if krb5_path.exists():
+                krb5_path.unlink()
     
-    def execute_query(self, query, params=None):
+    def get_session(self):
         """
-        Wykonuje zapytanie SQL
-        
-        Args:
-            query (str): Zapytanie SQL
-            params (tuple): Parametry zapytania (opcjonalne)
+        Zwraca nową sesję SQLAlchemy
         """
-        if not self.conn:
-            raise Exception("Brak aktywnego połączenia!")
-            
-        try:
-            cursor = self.conn.cursor()
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            return cursor
-        except pyodbc.Error as e:
-            print(f"Błąd podczas wykonywania zapytania: {str(e)}")
-            raise
-    
-    def close(self):
-        """
-        Zamyka połączenie z bazą
-        """
-        if self.conn:
-            self.conn.close()
-            print("Połączenie zostało zamknięte.")
+        if not self.Session:
+            raise Exception("Połączenie nie zostało zainicjalizowane!")
+        return self.Session()
 
 # Przykład użycia
-if __name__ == "__main__":
+def example_usage():
     # Konfiguracja połączenia
-    SERVER = "twoj-serwer.database.windows.net"
-    DATABASE = "twoja-baza"
-    USERNAME = "twoj_uzytkownik"
-    PASSWORD = "twoje_haslo"
-    AD_DOMAIN = "TWOJA-DOMENA"  # opcjonalne
+    config = {
+        "server": "sql-server.firma.com",
+        "database": "nazwa_bazy",
+        "domain": "FIRMA.COM",
+        "username": "user",
+        "password": "haslo"
+    }
     
-    # Utworzenie instancji klasy i połączenie
-    sql_conn = ADSQLConnection(
-        server=SERVER,
-        database=DATABASE,
-        username=USERNAME,
-        password=PASSWORD,
-        ad_domain=AD_DOMAIN
-    )
+    # Utworzenie instancji
+    db = SQLServerWindowsAuth(**config)
     
-    # Nawiązanie połączenia i test
-    sql_conn.connect_with_ad_user()
-    sql_conn.test_connection()
-    
-    # Przykład wykonania zapytania
-    cursor = sql_conn.execute_query("SELECT TOP 5 * FROM twoja_tabela")
-    for row in cursor.fetchall():
-        print(row)
-    
-    # Zamknięcie połączenia
-    sql_conn.close()
+    try:
+        # Nawiązanie połączenia
+        db.connect()
+        
+        # Przykład użycia
+        with db.get_session() as session:
+            result = session.execute(text("SELECT @@VERSION"))
+            version = result.scalar()
+            print(f"Wersja SQL Server: {version}")
+            
+    except Exception as e:
+        logger.error(f"Wystąpił błąd: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    example_usage()
